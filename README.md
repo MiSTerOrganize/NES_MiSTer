@@ -1,5 +1,7 @@
 # [Nintendo Entertainment System](https://en.wikipedia.org/wiki/Nintendo_Entertainment_System) for [MiSTer Platform](https://github.com/MiSTer-devel/Main_MiSTer/wiki)
 
+<a href="https://github.com/sponsors/MiSTerOrganize"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=GitHub&style=for-the-badge" alt="Sponsor" width="190"></a>
+
 This is an FPGA implementation of the NES/Famicom based on [FPGANES](https://github.com/strigeus/fpganes) by Ludvig Strigeus and ported to MiSTer.
 
 ## Features
@@ -85,3 +87,10 @@ The Miracle Piano is a MIDI keyboard compatible with the Miracle Piano Education
 
 Key: **Supported+Save state**, Supported, ~~Not Supported~~. Mappers that are not existent or not useful are blank.
 
+## Support
+
+<p align="center">
+  <a href="https://www.patreon.com/join/MiSTer_Organize">
+    <img src="assets/patreon_banner.png" alt="Support MiSTer Organize on Patreon" width="500">
+  </a>
+</p>
