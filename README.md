@@ -1,6 +1,37 @@
-# [Nintendo Entertainment System](https://en.wikipedia.org/wiki/Nintendo_Entertainment_System) for [MiSTer Platform](https://github.com/MiSTer-devel/Main_MiSTer/wiki)
+# NES_MiSTer - Mesen HD Pack Fork
 
 <a href="https://github.com/sponsors/MiSTerOrganize"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=GitHub&style=for-the-badge" alt="Sponsor" width="190"></a>
+
+This is a fork of the [MiSTer-devel NES core](https://github.com/MiSTer-devel/NES_MiSTer) that adds support for **Mesen HD packs** on MiSTer FPGA.
+
+An HD pack replaces the original NES picture, tile by tile and sprite by sprite, with high-resolution artwork, following the pack's own rules, the same way the [Mesen](https://github.com/SourMesen/Mesen2) emulator does. This fork draws those packs in the FPGA.
+
+**Status:** In development. No HD build has been released yet, and the code on this branch is still the upstream NES core. Until a release appears here, use the [official NES core](https://github.com/MiSTer-devel/NES_MiSTer).
+
+## What's Different from the Original
+
+In development:
+
+- A PC-side converter that turns a Mesen HD pack folder into a single pack file the core loads.
+- Frame capture: the tiles, sprites, CHR data and watched RAM of every NES frame are recorded for the HD engine.
+- An HD rendering engine that picks each tile's and sprite's replacement by the pack's rules and conditions, and draws the HD images, backgrounds and blend modes. Every stage is checked pixel by pixel against Mesen.
+- ROM patching: a pack's IPS, BPS or UPS patch is applied to the game as it loads, after the game's SHA1 is checked.
+
+Planned, not started yet:
+
+- HD pack audio (replacement music and sound effects).
+
+## How to Test
+
+Not available yet. When a test build is ready it will be published on this repo's [Releases](https://github.com/MiSTerOrganize/NES_MiSTer/releases) page, with instructions here.
+
+---
+
+## Original Core Features
+
+Everything below is the upstream NES core's README, unchanged.
+
+### [Nintendo Entertainment System](https://en.wikipedia.org/wiki/Nintendo_Entertainment_System) for [MiSTer Platform](https://github.com/MiSTer-devel/Main_MiSTer/wiki)
 
 This is an FPGA implementation of the NES/Famicom based on [FPGANES](https://github.com/strigeus/fpganes) by Ludvig Strigeus and ported to MiSTer.
 
