@@ -14,6 +14,8 @@ HD pack engine runs on the MiSTer's ARM CPU and draws each tile and sprite the w
 - The core's MiSTer framework (`fpga/sys`) is one Template_MiSTer update behind and will be refreshed.
 - All 124 packs in the collection have been converted and checked on a PC, and are installed on the
   developer's MiSTer for hardware testing. Report anything that looks or sounds wrong.
+- On the heaviest packs a frame's HD graphics are occasionally not ready in time. When that happens
+  the previous picture is shown again for one frame (1/60 of a second) instead of a black frame.
 
 ## What you need
 
