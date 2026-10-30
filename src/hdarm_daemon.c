@@ -49,6 +49,10 @@ int hdarm_frame(const uint8_t *rec, const uint8_t *vals, uint32_t nvals,
 #define LIST_LEN   0x00080000u
 #define MBOX_PA    0x3C400000u        /* mailbox; pack-state qword at + 8 */
 #define SEC_BLOCKS 4                  /* the block pixels: never read by the ARM */
+#define SEC_ROMFIX 14                 /* ROM patch runs: the service thread copies its own */
+#define SEC_AUDIO  15                 /* HD audio: the audio thread reads it, past 192 MB too */
+/* the sections hdarm4 reads; the rest are only named in the header */
+static int decision_section(int i) { return i != SEC_BLOCKS && i != SEC_ROMFIX && i != SEC_AUDIO; }
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int s) { (void)s; g_stop = 1; }
@@ -77,8 +81,11 @@ static void wr64(volatile uint8_t *p, uint64_t v) {
 #endif
 }
 
-/* The pack: header + every section but the block pixels, into a buffer the size of the whole
-   file (calloc'd, so the untouched block range costs no memory). */
+/* The pack: header + the sections the decisions read, into a buffer reaching the end of the
+   last of them (calloc'd, so untouched ranges cost no memory). The block pixels, the ROM patch
+   runs and the HD audio are left in DDR3 for the FPGA and the other threads: HD audio is most
+   of a large pack and may lie past the 192 MB window (Dragon Quest III: 264 MB of it), which
+   the decisions never need. */
 static uint8_t *load_pack(const volatile uint8_t *pk, size_t *len) {
     uint8_t hdr[0x200];
     fetch(hdr, pk, sizeof hdr);
@@ -86,15 +93,15 @@ static uint8_t *load_pack(const volatile uint8_t *pk, size_t *len) {
     size_t end = sizeof hdr;
     for (int i = 0; i < 18; i++) {
         uint32_t o = le32(hdr + 0x80 + 8 * i), s = le32(hdr + 0x84 + 8 * i);
-        if (s && (size_t)o + s > end) end = (size_t)o + s;
+        if (s && decision_section(i) && (size_t)o + s > end) end = (size_t)o + s;
     }
-    if (end > PACK_MAX) { fprintf(stderr, "hdarm: pack sections reach past 192 MB\n"); return NULL; }
+    if (end > PACK_MAX) { fprintf(stderr, "hdarm: decision sections reach past 192 MB\n"); return NULL; }
     uint8_t *buf = calloc(1, end);
     if (!buf) { fprintf(stderr, "hdarm: cannot allocate %zu bytes for the pack\n", end); return NULL; }
     memcpy(buf, hdr, sizeof hdr);
     for (int i = 0; i < 18; i++) {
         uint32_t o = le32(hdr + 0x80 + 8 * i), s = le32(hdr + 0x84 + 8 * i);
-        if (s && i != SEC_BLOCKS) fetch(buf + o, pk + o, s);
+        if (s && decision_section(i)) fetch(buf + o, pk + o, s);
     }
     *len = end;
     return buf;
@@ -368,6 +375,7 @@ int main(int argc, char **argv) {
     if (!rec || !held) { fprintf(stderr, "hdarm: out of memory\n"); return 1; }
     uint8_t *pack = NULL;
     uint32_t gen = 0, last = 0, nw = 0;
+    int refused = 0;                   /* the pack of generation gen was refused */
     wr64(mbox, 0);                                     /* nothing published */
     double t_copy = 0, t_dec = 0, t_pub = 0, t_worst = 0;
     unsigned n = 0, skipped = 0, torn = 0;
@@ -382,7 +390,9 @@ int main(int argc, char **argv) {
             forget_last();
             usleep(20000); continue;
         }
+        if (refused && (uint32_t)pw == gen) { usleep(20000); continue; }   /* a refused pack is tried once */
         if (!pack || (uint32_t)pw != gen) {
+            refused = 0;
             free(pack); pack = NULL; have_held = 0;
             forget_last();
             size_t len;
@@ -390,7 +400,7 @@ int main(int argc, char **argv) {
             pack = load_pack(pk, &len);
             if (!pack || hdarm_init(pack, len)) {
                 fprintf(stderr, "hdarm: pack refused\n");
-                free(pack); pack = NULL; gen = (uint32_t)pw; usleep(200000); continue;
+                free(pack); pack = NULL; gen = (uint32_t)pw; refused = 1; continue;
             }
             gen = (uint32_t)pw; nw = hdarm_nwatched(); last = 0;
             fprintf(stderr, "hdarm: pack generation %u loaded, %zu bytes, %u watched, %.1f ms\n",
