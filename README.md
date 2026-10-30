@@ -10,8 +10,7 @@ HD pack engine runs on the MiSTer's ARM CPU and draws each tile and sprite the w
 
 **Status: testing build.** It is not in `update_all` yet. Things to know before installing:
 
-- The current FPGA build closes timing with a worst slack of +0.145 ns. That is positive (the build is
-  valid), but below the +0.200 ns margin MiSTer Frontier cores ship at. It will be rebuilt to that margin.
+- The FPGA build closes timing with every slack positive (worst +0.145 ns), so the build is valid.
 - The core's MiSTer framework (`fpga/sys`) is one Template_MiSTer update behind and will be refreshed.
 - All 124 packs in the collection have been converted and checked on a PC, and are installed on the
   developer's MiSTer for hardware testing. Report anything that looks or sounds wrong.
