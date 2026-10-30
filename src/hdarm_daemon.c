@@ -268,6 +268,68 @@ static void publish(volatile uint8_t *lists, volatile uint8_t *mbox, uint32_t fi
     wr64(mbox, 0xA5ull << 56 | (uint64_t)np << 32 | fid);
 }
 
+/* ------------------------------------------------------------------ the pacer thread
+ * The scan-out has no frame buffer, only an 8-line ring (hd3_scanout.sv): a frame whose list has
+ * not been published by the time it is shown is BLACK. A frame whose decisions take longer than a
+ * frame period (heavy packs: Mega Man Super spikes to 30+ ms) would flash black. The pacer, on
+ * core 1, watches the frame records; when a new record appears while the main thread is still
+ * deciding, nobody would publish for that frame, so it publishes the last list again under a new
+ * frame id. The FPGA then paints the previous picture once more: a late frame is held for a frame
+ * instead of going black. The main thread's list still goes out the moment it is ready.
+ * All publishing (main thread and pacer) goes through g_pub_lock, which owns g_fid and the copy
+ * of the last published list. */
+static pthread_mutex_t g_pub_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile uint8_t *g_lists, *g_recs;
+static uint32_t g_fid;                       /* last frame id published (under g_pub_lock) */
+static uint64_t *g_last;                     /* the last published list (under g_pub_lock) */
+static size_t g_last_nq;
+static int g_have_last;                      /* g_last belongs to the current pack */
+static volatile int g_busy;                  /* main thread is copying/deciding a record */
+static volatile unsigned g_held;             /* pacer re-publishes since the last stats line */
+
+static void publish_main(const uint64_t *dl, size_t nq) {
+    pthread_mutex_lock(&g_pub_lock);
+    g_fid++; if (!g_fid) g_fid = 1;
+    publish(g_lists, g_mbox, g_fid, dl, nq);
+    memcpy(g_last, dl, nq * 8); g_last_nq = nq; g_have_last = 1;
+    pthread_mutex_unlock(&g_pub_lock);
+}
+
+static void forget_last(void) {              /* the pack changed or went away */
+    pthread_mutex_lock(&g_pub_lock);
+    g_have_last = 0;
+    pthread_mutex_unlock(&g_pub_lock);
+}
+
+static void *pacer(void *arg) {
+    (void)arg;
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(1, &cs);
+    pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
+    struct sched_param sp = { .sched_priority = 5 };
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);   /* best effort: fine if refused */
+    uint32_t seen = 0;
+    while (!g_stop) {
+        uint32_t f0 = (uint32_t)rd64(g_recs + TRAILER), f1 = (uint32_t)rd64(g_recs + REC_LEN + TRAILER);
+        uint32_t N = f0 > f1 ? f0 : f1;
+        if (N > seen) {
+            seen = N;
+            if (g_busy) {
+                pthread_mutex_lock(&g_pub_lock);
+                if (g_have_last && g_busy) {
+                    g_fid++; if (!g_fid) g_fid = 1;
+                    publish(g_lists, g_mbox, g_fid, g_last, g_last_nq);
+                    g_held++;
+                }
+                pthread_mutex_unlock(&g_pub_lock);
+            }
+        } else if (N < seen) {
+            seen = N;                        /* the NES was reset: frame numbers restarted */
+        }
+        usleep(250);
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     int stats = 300, once = 0, lag = 1;
     for (int i = 1; i < argc; i++) {
@@ -291,9 +353,13 @@ int main(int argc, char **argv) {
         cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(0, &cs);
         pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
     }
-    pthread_t svc, aud;
+    g_lists = lists; g_recs = recs;
+    g_last = malloc(LIST_LEN);          /* the pacer's copy of the last published list */
+    if (!g_last) { fprintf(stderr, "hdarm: out of memory\n"); return 1; }
+    pthread_t svc, aud, pac;
     if (pthread_create(&svc, NULL, service, NULL)) { perror("pthread_create"); return 1; }
     if (pthread_create(&aud, NULL, audio, NULL)) { perror("pthread_create"); return 1; }
+    if (!once && pthread_create(&pac, NULL, pacer, NULL)) { perror("pthread_create"); return 1; }
 
     uint8_t *rec = calloc(1, REC_LEN);  /* fetch_record fills only the parts hdarm4 reads */
     uint64_t *held = malloc(LIST_LEN);  /* --lag 1: the decided list waiting for the next record */
@@ -301,7 +367,7 @@ int main(int argc, char **argv) {
     int have_held = 0;
     if (!rec || !held) { fprintf(stderr, "hdarm: out of memory\n"); return 1; }
     uint8_t *pack = NULL;
-    uint32_t gen = 0, last = 0, fid = 0, nw = 0;
+    uint32_t gen = 0, last = 0, nw = 0;
     wr64(mbox, 0);                                     /* nothing published */
     double t_copy = 0, t_dec = 0, t_pub = 0, t_worst = 0;
     unsigned n = 0, skipped = 0, torn = 0;
@@ -313,10 +379,12 @@ int main(int argc, char **argv) {
         if (!valid) {                                  /* no pack: stay quiet */
             if (pack) { free(pack); pack = NULL; wr64(mbox, 0); fprintf(stderr, "hdarm: pack gone\n"); }
             have_held = 0;                             /* a held list belongs to the old pack */
+            forget_last();
             usleep(20000); continue;
         }
         if (!pack || (uint32_t)pw != gen) {
             free(pack); pack = NULL; have_held = 0;
+            forget_last();
             size_t len;
             double t0 = now_ms();
             pack = load_pack(pk, &len);
@@ -341,16 +409,18 @@ int main(int argc, char **argv) {
         }
         double t0 = now_ms();
         if (have_held) {                               /* --lag 1: F-1's list goes out first */
-            fid++; if (!fid) fid = 1;
-            publish(lists, mbox, fid, held, held_nq);
+            publish_main(held, held_nq);
             have_held = 0;
         }
         double tp = now_ms();
+        g_busy = 1;                                    /* from here a new record finds us busy */
         fetch_record(rec, bank);
-        if ((uint32_t)rd64(bank + TRAILER) != F) { torn++; continue; }  /* overwritten mid-copy */
+        if ((uint32_t)rd64(bank + TRAILER) != F) { g_busy = 0; torn++; continue; }  /* overwritten mid-copy */
         double t1 = now_ms();
         const uint64_t *dl; size_t nq;
-        if (hdarm_frame(rec, vals, nw, &dl, &nq)) { fprintf(stderr, "hdarm: frame %u refused\n", F); last = F; continue; }
+        int refused = hdarm_frame(rec, vals, nw, &dl, &nq);
+        g_busy = 0;
+        if (refused) { fprintf(stderr, "hdarm: frame %u refused\n", F); last = F; continue; }
         double t2 = now_ms();
         size_t np = (nq + 7) & ~(size_t)7;
         if (np * 8 > LIST_LEN) { fprintf(stderr, "hdarm: list of %zu qwords too long\n", nq); last = F; continue; }
@@ -359,8 +429,7 @@ int main(int argc, char **argv) {
         if (lag) {                                     /* hdarm_frame's list is its own buffer */
             memcpy(held, dl, nq * 8); held_nq = nq; have_held = 1;
         } else {
-            fid++; if (!fid) fid = 1;
-            publish(lists, mbox, fid, dl, nq);
+            publish_main(dl, nq);
         }
         double t3 = now_ms();
         t_copy += t1 - tp; t_dec += t2 - t1; t_pub += (tp - t0) + (t3 - t2);
@@ -369,9 +438,10 @@ int main(int argc, char **argv) {
         n++;
         if (once) break;
         if (stats && n % stats == 0) {
+            unsigned held_now = g_held; g_held = 0;
             fprintf(stderr, "hdarm: %u frames  copy %.2f  decide %.2f  publish %.2f ms avg  worst %.2f  "
-                    "skipped %u  torn %u  max list %zu\n",
-                    n, t_copy / stats, t_dec / stats, t_pub / stats, t_worst, skipped, torn, maxq);
+                    "skipped %u  held %u  torn %u  max list %zu\n",
+                    n, t_copy / stats, t_dec / stats, t_pub / stats, t_worst, skipped, held_now, torn, maxq);
             t_copy = t_dec = t_pub = t_worst = 0; skipped = torn = 0;
         }
     }
@@ -379,6 +449,7 @@ int main(int argc, char **argv) {
     g_stop = 1;
     pthread_join(svc, NULL);
     pthread_join(aud, NULL);
+    if (!once) pthread_join(pac, NULL);
     fprintf(stderr, "hdarm: stopped after %u frames\n", n);
     return 0;
 }
