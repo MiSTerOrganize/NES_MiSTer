@@ -107,7 +107,13 @@ parameter CONF_STR = {
 	"P1ORS,Mask Edges,Off,Left,Both,Auto;",
 	"P1OP,Extra Sprites,Off,On;",
 	"P1-;",
+`ifdef HD_PAINT
+	// a mount, not a transfer: MiSTer stores the path in config/NES_HD.s1 and the ARM copies the
+	// pack into DDR3 itself (hd3_loader.sv). Drive 1: drive 0 is the save file.
+	"P1SC1,HDP,Load HD Pack;",
+`else
 	"P1FC4,HDP,Load HD Pack;",
+`endif
 	"P1O[88],HD Pack,Off,On;",
 	"P1-;",
 	"P1OUV,Audio Enable,Both,Internal,Cart Expansion,None;",
@@ -288,6 +294,11 @@ wire        sd_buff_wr;
 wire        img_mounted;
 wire        img_readonly;
 wire [63:0] img_size;
+// hps_io has two drives: 0 = the save file (everything below), 1 = the HD pack mount ("Load HD
+// Pack", read by the ARM, never by the core: its block requests are tied off).
+wire  [1:0] sd_ack_v, img_mounted_v;
+assign sd_ack      = sd_ack_v[0];
+assign img_mounted = img_mounted_v[0];
 
 // filetype / ioctl_downloading / ioctl_addr / loader_clk / file_input are the download the CORE
 // sees: hps_io's own, or the ROM patcher's replay of the patched ROM (hd3_romfix, stage 5).
@@ -314,7 +325,7 @@ wire        forced_scandoubler;
 
 wire [21:0] gamma_bus;
 
-hps_io #(.CONF_STR(CONF_STR)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .VDNUM(2)) hps_io
 (
 	.clk_sys(clk),
 	.HPS_BUS(HPS_BUS),
@@ -350,15 +361,15 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.ioctl_wait(ioctl_wait | save_wait | hd_load_wait | rom_stall),
 	.ioctl_index(hps_index),
 
-	.sd_lba('{sd_lba}),
-	.sd_rd(sd_rd),
-	.sd_wr(sd_wr),
-	.sd_ack(sd_ack),
+	.sd_lba('{sd_lba, 32'd0}),
+	.sd_rd({1'b0, sd_rd}),
+	.sd_wr({1'b0, sd_wr}),
+	.sd_ack(sd_ack_v),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
-	.sd_buff_din('{sd_buff_din}),
+	.sd_buff_din('{sd_buff_din, 8'd0}),
 	.sd_buff_wr(sd_buff_wr),
-	.img_mounted(img_mounted),
+	.img_mounted(img_mounted_v),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
 

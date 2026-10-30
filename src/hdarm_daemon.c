@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <sched.h>
 #include "hdarm_rec.h"                /* fetch(), fetch_record(), REC_LEN, TRAILER */
@@ -263,6 +264,138 @@ static void *audio(void *arg) {
     return NULL;
 }
 
+/* ------------------------------------------------------------------ the pack loader thread
+ * "Load HD Pack" is a mount (SC1): MiSTer stores the chosen path in config/NES_HD.s1 and sends
+ * the core nothing. This thread, on core 1, copies the file from the SD card straight into DDR3
+ * (bytes below 192 MB at 0x30000000, the rest at 0x24000000) at the card's speed, then has the
+ * FPGA check it (rtl/hdpack/hd3_loader.sv). The command qword (mailbox + 0x60):
+ *   [63:56] 0xC5  [55:48] 1 = BEGIN, 2 = COMMIT  [47:40] sequence  [31:0] file size
+ * The answer is the pack-state qword (mailbox + 8): [47:40] the sequence carried out, [48] valid,
+ * [39:36] why a COMMIT was refused. BEGIN invalidates the pack first, so the FPGA stops reading it
+ * before it is overwritten; COMMIT makes the FPGA read the header back and judge it.
+ * The .s1 file is watched by its modification time (MiSTer rewrites it on every pick, the same
+ * file included). At start-up, if the FPGA has no valid pack, the remembered pack (.s1, or .f4
+ * from the earlier "Load HD Pack" that streamed the file) is loaded, as that one did. */
+#define CMD_OFF   0x60
+#define S1_PATH   "/media/fat/config/NES_HD.s1"
+#define F4_PATH   "/media/fat/config/NES_HD.f4"
+static const char *const reject_why[16] = {
+    "accepted", "not an HD pack (magic)", "wrong format version", "bad scale", "unknown flag bits",
+    "size differs from the header (truncated or wrong file)", "larger than 384 MB",
+    "bad bucket count", "a section lies outside the file or the 192 MB window",
+    "-", "too many watched addresses", "inconsistent addition table", "unknown command",
+    "-", "-", "-" };
+
+static long mtime_ms(const char *path) {
+    struct stat st;
+    if (stat(path, &st)) return -1;
+    return (long)st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
+}
+
+/* the path MiSTer stored (NUL-terminated; the rest of its buffer may hold stale bytes) */
+static int read_cfg_path(const char *cfg, char *out, size_t outlen) {
+    char buf[1024];
+    int fd = open(cfg, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    size_t l = strnlen(buf, (size_t)n);
+    while (l && (buf[l - 1] == '\n' || buf[l - 1] == '\r' || buf[l - 1] == ' ')) buf[--l] = 0;
+    if (!l) return 0;
+    snprintf(out, outlen, "%s%s", buf[0] == '/' ? "" : "/media/fat/", buf);
+    return 1;
+}
+
+/* write a command and wait for its answer; a command written before the FPGA took its baseline
+   read is never answered, so it is sent again under a new sequence */
+static int pk_command(int op, uint32_t size, uint64_t *answer) {
+    volatile uint8_t *cmq = g_mbox + CMD_OFF, *stq = g_mbox + 8;
+    uint8_t seq = (uint8_t)(rd64(cmq) >> 40);
+    for (int attempt = 0; attempt < 3; attempt++) {
+        seq++;
+        __sync_synchronize();
+        wr64(cmq, 0xC5ull << 56 | (uint64_t)op << 48 | (uint64_t)seq << 40 | size);
+        double t0 = now_ms();
+        while (now_ms() - t0 < 1000 && !g_stop) {
+            uint64_t s = rd64(stq);
+            if ((s >> 56) == 0x5A && (uint8_t)(s >> 40) == seq) { *answer = s; return 0; }
+            usleep(1000);
+        }
+    }
+    return 1;
+}
+
+/* 0 = loaded (or refused by the FPGA: reported), 1 = not loaded, 2 = .s1 changed mid-copy */
+static int load_pack_file(const char *path, long s1_when) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "hdarm: cannot open %s\n", path); return 1; }
+    struct stat st;
+    char magic[4];
+    if (fstat(fd, &st) || read(fd, magic, 4) != 4 || memcmp(magic, "NHDP", 4)) {
+        fprintf(stderr, "hdarm: %s is not an HD pack\n", path); close(fd); return 1;
+    }
+    if (st.st_size < 0x110 || (uint64_t)st.st_size > PACK_TOT) {
+        fprintf(stderr, "hdarm: %s: %lld bytes, not loadable\n", path, (long long)st.st_size);
+        close(fd); return 1;
+    }
+    uint32_t size = (uint32_t)st.st_size;
+    uint64_t ans;
+    if (pk_command(1, 0, &ans)) {
+        fprintf(stderr, "hdarm: the core does not answer the pack loader (an older RBF?)\n");
+        close(fd); return 1;
+    }
+    fprintf(stderr, "hdarm: loading %s (%.1f MB)\n", path, size / 1048576.0);
+    double t0 = now_ms();
+    lseek(fd, 0, SEEK_SET);
+    for (uint32_t off = 0; off < size; ) {
+        if (g_stop || (s1_when >= 0 && mtime_ms(S1_PATH) != s1_when)) { close(fd); return 2; }
+        uint32_t n = size - off < 0x100000 ? size - off : 0x100000;   /* never straddles 192 MB */
+        volatile uint8_t *dst = off < PACK_MAX ? g_pk + off : g_ovf + (off - PACK_MAX);
+        ssize_t r = read(fd, (void *)dst, n);
+        if (r <= 0) { fprintf(stderr, "hdarm: read error at %u\n", off); close(fd); return 1; }
+        off += (uint32_t)r;
+    }
+    close(fd);
+    double t1 = now_ms();
+    __sync_synchronize();
+    if (pk_command(2, size, &ans)) { fprintf(stderr, "hdarm: no answer to the pack check\n"); return 1; }
+    unsigned rj = (unsigned)(ans >> 36) & 15;
+    if ((ans >> 48) & 1)
+        fprintf(stderr, "hdarm: pack loaded in %.1f s (%.1f MB/s), checked in %.0f ms\n",
+                (t1 - t0) / 1000, size / 1048576.0 / ((t1 - t0) / 1000), now_ms() - t1);
+    else
+        fprintf(stderr, "hdarm: pack refused by the core: %s (code %u)\n", reject_why[rj], rj);
+    return 0;
+}
+
+static void *loader(void *arg) {
+    (void)arg;
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(1, &cs);
+    pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
+    char path[1100];
+    long seen = mtime_ms(S1_PATH);
+    usleep(500000);                                      /* let the FPGA take its baseline */
+    uint64_t pw = rd64(g_mbox + 8);
+    if (!((pw >> 56) == 0x5A && ((pw >> 48) & 1))) {     /* no pack yet: the remembered one */
+        if (read_cfg_path(S1_PATH, path, sizeof path) || read_cfg_path(F4_PATH, path, sizeof path))
+            load_pack_file(path, seen);
+    }
+    while (!g_stop) {
+        long m = mtime_ms(S1_PATH);
+        if (m >= 0 && m != seen) {
+            seen = m;
+            usleep(100000);                              /* MiSTer may still be writing it */
+            seen = mtime_ms(S1_PATH);
+            if (read_cfg_path(S1_PATH, path, sizeof path) && load_pack_file(path, seen) == 2)
+                seen = -2;                               /* picked again mid-copy: start over */
+        }
+        usleep(250000);
+    }
+    return NULL;
+}
+
 /* Copy a list into buffer (fid & 3), pad it to a multiple of 8 qwords, then name it in the
    mailbox: the list lands before the mailbox moves. */
 static void publish(volatile uint8_t *lists, volatile uint8_t *mbox, uint32_t fid,
@@ -363,9 +496,10 @@ int main(int argc, char **argv) {
     g_lists = lists; g_recs = recs;
     g_last = malloc(LIST_LEN);          /* the pacer's copy of the last published list */
     if (!g_last) { fprintf(stderr, "hdarm: out of memory\n"); return 1; }
-    pthread_t svc, aud, pac;
+    pthread_t svc, aud, pac, ldr;
     if (pthread_create(&svc, NULL, service, NULL)) { perror("pthread_create"); return 1; }
     if (pthread_create(&aud, NULL, audio, NULL)) { perror("pthread_create"); return 1; }
+    if (pthread_create(&ldr, NULL, loader, NULL)) { perror("pthread_create"); return 1; }
     if (!once && pthread_create(&pac, NULL, pacer, NULL)) { perror("pthread_create"); return 1; }
 
     uint8_t *rec = calloc(1, REC_LEN);  /* fetch_record fills only the parts hdarm4 reads */
@@ -459,6 +593,7 @@ int main(int argc, char **argv) {
     g_stop = 1;
     pthread_join(svc, NULL);
     pthread_join(aud, NULL);
+    pthread_join(ldr, NULL);
     if (!once) pthread_join(pac, NULL);
     fprintf(stderr, "hdarm: stopped after %u frames\n", n);
     return 0;

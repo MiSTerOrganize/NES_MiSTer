@@ -23,11 +23,16 @@
 //                             [63:56] 0xA5. The ARM publishes in multiples of 8 qwords (padding
 //                             after the last EOL); the painter reads only published bursts.
 //   0x3C400008                pack-state qword, written by this engine: [31:0] generation (+1
-//                             each time a pack becomes valid), [48] pack valid, [63:56] 0x5A.
-//                             The ARM re-reads the pack (the .hdp verbatim at 0x30000000) when
-//                             the generation moves, and stops publishing while it is not valid.
+//                             each time a pack becomes valid), [39:36] reject, [47:40] last load
+//                             command carried out, [48] pack valid, [63:56] 0x5A. The ARM
+//                             re-reads the pack (the .hdp at 0x30000000) when the generation
+//                             moves, and stops publishing while it is not valid.
 //   0x3C400040 / +0x48        ROM patcher status / command (hd3_romfix.sv, romfix_arm.h)
 //   0x3C400050                HD audio status, written by this engine (hd3_audio.sv, aud_arm.h)
+//   0x3C400060                pack load command, written by the ARM after it copies a pack into
+//                             DDR3 (hd3_loader.sv: BEGIN / COMMIT, sequence, file size)
+//   0x30000000 / 0x24000000   the pack: file bytes below 192 MB / from 192 MB on, written by
+//                             the ARM (hdarm_daemon.c); hd3_loader reads its header back
 //   0x3C800000 / 0x3CC00000   ROM patcher staged ROM / target, 4 MB each
 //   0x3D000000                HD audio event log (2048 x 2 qwords)
 //   0x3D010000                HD audio PCM slots, written by the ARM (4096 x 8 qwords)
@@ -49,7 +54,9 @@ module hd3_pengine #(
 	input             reset,                 // core clock: the NES reset
 	input             enable,                // "HD Pack" OSD option
 
-	// pack load (core clock)
+	// pack load (core clock). The ARM copies the pack into DDR3 and hd3_loader reads it back
+	// (see its header), so the OSD file transfer is not used: these three inputs are unused
+	// and load_wait is 0. They stay so the ports match hd3_engine's.
 	input             load_active,
 	input             load_wr,
 	input       [7:0] load_data,
@@ -169,13 +176,14 @@ localparam integer RSW = 10;
 // ==========================================================================================
 // pack loader (core clock)
 // ==========================================================================================
-wire        ld_wr_req, ld_wr_hi;
-wire [27:3] ld_wr_addr;
 wire [28:0] aud_off;
 wire [31:0] aud_len;
-wire [63:0] ld_wr_data;
-reg         ld_wr_ack = 0;
 wire        pack_ok;
+wire  [7:0] ld_ack_seq;                  // the last load command carried out
+wire        ld_st_t;                     // toggles when pack_ok / reject / ld_ack_seq change
+wire        ld_req, ld_ready;            // the loader's reads (the single-access crossing)
+wire [27:3] ld_addr;
+wire [63:0] ssc_dout;
 wire  [7:0] scale, flags;
 wire [31:0] options, bucket_mask, hdr2c, hdr30, hdr34, fb_len, abucket_mask;
 wire [15:0] max_probe, amax_probe;
@@ -188,10 +196,8 @@ wire        game_ram, legacy, add_en, has_pal, cache_en, render_orig;
 
 hd3_loader loader (
 	.clk(clk), .reset(reset),
-	.load_active(load_active), .load_wr(load_wr), .load_data(load_data), .load_wait(load_wait),
-	.wr_req(ld_wr_req), .wr_hi(ld_wr_hi), .wr_addr(ld_wr_addr), .wr_data(ld_wr_data),
-	.wr_ack(ld_wr_ack),
-	.pack_ok(pack_ok), .reject(reject),
+	.m_req(ld_req), .m_addr(ld_addr), .m_dout(ssc_dout), .m_ready(ld_ready),
+	.pack_ok(pack_ok), .reject(reject), .ack_seq(ld_ack_seq), .st_t(ld_st_t),
 	.scale(scale), .flags(flags), .options(options), .bucket_mask(bucket_mask),
 	.max_probe(max_probe), .keys_base(keys_base), .rules_base(rules_base),
 	.hdr_word0x2c(hdr2c), .hdr_word0x30(hdr30), .hdr_word0x34(hdr34),
@@ -220,17 +226,7 @@ assign list_n  = pack_ok ? hdr34[8:0] : 9'd0;    // the loader refuses more than
 reg reset_f = 1;
 always @(posedge clk_f) reset_f <= reset | ~active;
 
-// pack-load writes: the loader holds wr_req until wr_ack
-wire        ldx_ready, ldf_v;
-wire [89:0] ldf_d;                       // {hi, qword address, data}
-wire        ld_take = ld_wr_req & ~ld_wr_ack & ldx_ready;
-always @(posedge clk) ld_wr_ack <= ld_take;
-wire        ddr_wr_ack;
-hd3_xq #(.W(90)) ldx (
-	.clk(clk), .i_valid(ld_wr_req & ~ld_wr_ack), .i_data({ld_wr_hi, ld_wr_addr, ld_wr_data}),
-	.i_ready(ldx_ready),
-	.clk_f(clk_f), .o_valid(ldf_v), .o_data(ldf_d), .o_ready(ddr_wr_ack)
-);
+assign load_wait = 1'b0;                 // no OSD file transfer to hold (see the ports)
 
 // record writes
 wire        cwf_v, cwf_r;
@@ -252,7 +248,6 @@ wire        rf_req, rf_rnw, rf_ready;
 wire [27:3] rf_addr;
 wire [63:0] rf_din;
 wire  [7:0] rf_be;
-wire [63:0] ssc_dout;
 wire        ssc_ready;
 hd3_romfix romfix (
 	.clk(clk),
@@ -266,14 +261,17 @@ hd3_romfix romfix (
 	.content(rom_content), .result(rom_result)
 );
 
-// savestates and the ROM patcher share one single-access crossing. Both request with a pulse
-// and are answered with a pulse; a request waits (latched) while the other is in flight.
-reg         ssa_p = 0, rfa_p = 0, x_busy = 0, x_own = 0, x_req = 0;
+// savestates, the ROM patcher and the pack loader share one single-access crossing. Each
+// requests with a pulse and is answered with a pulse; a request waits (latched) while another
+// is in flight. Priority: savestates, then the ROM patcher, then the loader (reads only).
+localparam [1:0] OWN_SS = 2'd0, OWN_RF = 2'd1, OWN_LD = 2'd2;
+reg         ssa_p = 0, rfa_p = 0, lda_p = 0, x_busy = 0, x_req = 0;
+reg   [1:0] x_own = OWN_SS;
 reg  [27:1] ssa_addr, x_addr;
 reg  [63:0] ssa_din, x_din;
 reg   [7:0] ssa_be, x_be;
 reg         ssa_rnw, x_rnw;
-reg  [27:3] rfa_addr;
+reg  [27:3] rfa_addr, lda_addr;
 reg  [63:0] rfa_din;
 reg   [7:0] rfa_be;
 reg         rfa_rnw;
@@ -281,20 +279,25 @@ always @(posedge clk) begin
 	x_req <= 0;
 	if (ss_req) begin ssa_p <= 1; ssa_addr <= ss_addr; ssa_din <= ss_din; ssa_be <= ss_be; ssa_rnw <= ss_rnw; end
 	if (rf_req) begin rfa_p <= 1; rfa_addr <= rf_addr; rfa_din <= rf_din; rfa_be <= rf_be; rfa_rnw <= rf_rnw; end
+	if (ld_req) begin lda_p <= 1; lda_addr <= ld_addr; end
 	if (ssc_ready) x_busy <= 0;
 	else if (!x_busy && !x_req) begin
 		if (ssa_p) begin
-			ssa_p <= 0; x_busy <= 1; x_own <= 0; x_req <= 1;
+			ssa_p <= 0; x_busy <= 1; x_own <= OWN_SS; x_req <= 1;
 			x_addr <= ssa_addr; x_din <= ssa_din; x_be <= ssa_be; x_rnw <= ssa_rnw;
 		end else if (rfa_p) begin
-			rfa_p <= 0; x_busy <= 1; x_own <= 1; x_req <= 1;
+			rfa_p <= 0; x_busy <= 1; x_own <= OWN_RF; x_req <= 1;
 			x_addr <= {rfa_addr, 2'b00}; x_din <= rfa_din; x_be <= rfa_be; x_rnw <= rfa_rnw;
+		end else if (lda_p) begin
+			lda_p <= 0; x_busy <= 1; x_own <= OWN_LD; x_req <= 1;
+			x_addr <= {lda_addr, 2'b00}; x_din <= 64'd0; x_be <= 8'h00; x_rnw <= 1'b1;
 		end
 	end
 end
 assign ss_dout  = ssc_dout;
-assign ss_ack   = ssc_ready & ~x_own;
-assign rf_ready = ssc_ready &  x_own;
+assign ss_ack   = ssc_ready & (x_own == OWN_SS);
+assign rf_ready = ssc_ready & (x_own == OWN_RF);
+assign ld_ready = ssc_ready & (x_own == OWN_LD);
 
 // savestates
 wire [27:1] ssf_addr;
@@ -338,14 +341,16 @@ wire        ww_v;
 wire [27:3] ww_a;
 wire [63:0] ww_d;
 // pack-state word, byte 0x3C400008 (the qword after the mailbox), for the ARM program:
-// [31:0] generation (+1 each time a pack becomes valid), [48] pack valid, [63:56] 0x5A.
-// Written at power-up (so stale DDR3 contents never read as a pack) and on every change of
-// pack_ok. The pack itself is the .hdp verbatim at byte 0x30000000.
+// [31:0] generation (+1 each time a pack becomes valid), [39:36] reject (hd3_loader; 0 =
+// accepted), [47:40] sequence of the last load command carried out, [48] pack valid, [63:56]
+// 0x5A. Written at power-up (so stale DDR3 contents never read as a pack: all zero but the
+// 0x5A, which the ARM also reads as "freshly powered up") and every time the loader answers a
+// command. The pack itself is the .hdp at byte 0x30000000 (file bytes from 192 MB on at
+// 0x24000000), copied there by the ARM.
 localparam [24:0] PACK_Q = 25'h1880001;
 reg         pk_v = 1;
 reg  [63:0] pk_d = {8'h5A, 56'd0};
-reg   [1:0] pk_s = 0;                   // pack_ok synchronised into the HD clock (a slow level)
-reg         pk_last = 0;
+reg   [2:0] pk_s = 0;                   // ld_st_t synchronised into the HD clock
 reg  [31:0] pk_gen = 0;
 wire        dw_ready;
 wire        dw_valid = cwf_v | ww_v | pk_v | aw_v;
@@ -354,13 +359,16 @@ wire        ww_take  = dw_ready & ~cwf_v & ww_v;
 wire        pk_take  = dw_ready & ~cwf_v & ~ww_v & pk_v;
 wire        aw_ready = dw_ready & ~cwf_v & ~ww_v & ~pk_v;   // taken on this clock when aw_v
 always @(posedge clk_f) begin
-	pk_s <= {pk_s[0], pack_ok};
+	pk_s <= {pk_s[1:0], ld_st_t};
 	if (pk_take) pk_v <= 0;
-	if (pk_s[1] != pk_last) begin       // a change after the take wins: the newer value is written
-		pk_last <= pk_s[1];
+	// an answer after the take wins: the newer value is written. pack_ok, reject and
+	// ld_ack_seq were set with the toggle and hold until the next command (milliseconds away),
+	// so they are stable by the time the synchronised toggle edge arrives.
+	if (pk_s[2] != pk_s[1]) begin
 		pk_v    <= 1;
-		pk_d    <= {8'h5A, 7'd0, pk_s[1], 16'd0, pk_s[1] ? pk_gen + 32'd1 : pk_gen};
-		if (pk_s[1]) pk_gen <= pk_gen + 32'd1;
+		pk_d    <= {8'h5A, 7'd0, pack_ok, ld_ack_seq, reject, 4'd0,
+		            pack_ok ? pk_gen + 32'd1 : pk_gen};
+		if (pack_ok) pk_gen <= pk_gen + 32'd1;
 	end
 end
 
@@ -370,8 +378,8 @@ hd3_ddr #(.NR(NR)) ddr (
 	.DDRAM_RD(DDRAM_RD), .DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE),
 	.ch1_addr(ssf_addr), .ch1_dout(ssf_dout), .ch1_din(ssf_din), .ch1_req(ssf_req),
 	.ch1_rnw(ssf_rnw), .ch1_be(ssf_be), .ch1_ready(ssf_ready),
-	.wr_req(ldf_v), .wr_hi(ldf_d[89]), .wr_addr(ldf_d[88:64]), .wr_data(ldf_d[63:0]),
-	.wr_ack(ddr_wr_ack),
+	.wr_req(1'b0), .wr_hi(1'b0), .wr_addr(25'd0), .wr_data(64'd0),   // the ARM writes the pack
+	.wr_ack(),
 	.cw_valid(dw_valid),
 	.cw_addr(cwf_v ? cwf_d[96:72] : ww_v ? ww_a : pk_v ? PACK_Q : aw_a),
 	.cw_data(cwf_v ? cwf_d[71:8]  : ww_v ? ww_d : pk_v ? pk_d   : aw_d),

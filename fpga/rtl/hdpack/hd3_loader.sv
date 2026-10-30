@@ -1,62 +1,63 @@
-// hd3_loader.sv - streams a format-3 .hdp from the OSD file load into DDR3 (stage 2).
+// hd3_loader.sv - the format-3 .hdp loader of the display-list route (hd3_pengine).
 //
-// The file is stored verbatim from qword PACK_Q (byte 0 of the file at the window offset
-// PACK_Q*8), so every section offset in the header is also a DDR3 offset from that base.
-// Bytes from MAX_BYTES (192 MB) on go to the overflow window instead (wr_hi, from qword OVF_Q
-// of the 0x20000000 region, i.e. 0x24000000): only section 15 (audio, laid out last by the
-// converter) may reach there, and hd3_audio maps its file offsets the same way.
-// The loader counts bytes itself: hps_io's ioctl_addr is 27 bits (128 MB) and the largest
-// corpus pack is 157 MB, so the address from the framework cannot be trusted to reach the end.
+// The ARM copies the pack into DDR3 itself (hdarm_daemon.c, the pack loader thread): file bytes
+// below MAX_BYTES (192 MB) at the pack window (qword PACK_Q, byte 0x30000000), the rest at the
+// overflow window (0x24000000), where hd3_audio already maps them. Copying from the SD card runs
+// at the card's speed (~17 MB/s, a 300 MB pack in ~18 s); the OSD file transfer this replaces
+// (hd3_loader_stream.sv, still used by hd3_engine) ran at ~0.6 MB/s. The OSD entry "Load HD Pack"
+// is a mount (SC1): MiSTer stores the chosen path in config/NES_HD.s1 and transfers nothing.
 //
-// The header words the engine needs are kept in registers as the header streams past (the
-// words used, not the whole 512-byte header: the full copy cost about 2,000 registers and a
-// combinational bounds check over every entry about 1,000 LUTs - yosys estimate, 2026-10-15).
-// Each section-table entry (18 of them, bytes 0x80-0x10F) is checked the moment its 8 bytes
-// arrive; the file-size word (0x20) is complete long before the table. When the load ends the
-// pack is accepted only if all of these hold, otherwise pack_ok stays 0 and the engine stays
-// off (the NES picture is unaffected):
-//   magic "NHDP", format version 3, scale 1-10, no flag bits beyond the six defined ones,
-//   header file size == bytes received, file size <= MAX_TOTAL, bucket count a power of
-//   two (and not 0), the whole section table received, every section's offset + size inside
-//   the file and its offset qword aligned, every section but 15 (audio) ending inside the
-//   MAX_BYTES pack window, at most 256 watched addresses that fit in section 9
-//   (reject 10), and a consistent addition table (reject 11): additions (header 0x40) present
-//   only with section 16, section 16 = 64 bytes per bucket with a power-of-two bucket count
-//   (header 0x4C) and section 17 present with it; no additions = no table, count and probe 0.
-//   A pack with additions and no table is a stale conversion: drawing it without its additions
-//   would be silently wrong, so it is refused.
+// The ARM drives this module through one command qword it writes beside the mailbox (CMD_Q,
+// byte 0x3C400060):
+//   [63:56] 0xC5   [55:48] op: 1 = BEGIN, 2 = COMMIT   [47:40] sequence   [31:0] file size
+// The loader reads it every 2^POLL_W clocks through the engine's single-access DDR3 crossing. A
+// command is carried out once: its sequence must differ from the last one carried out. The first
+// read after power-up only records the sequence it finds: DDR3 keeps an old command across a
+// core reload, and that one must not run again.
+//   BEGIN   pack_ok -> 0 at once, so the engine, HD audio and the ROM patcher stop reading the
+//           pack and the ARM may overwrite it. Answered at once.
+//   COMMIT  reads the header (qwords 0..33: every word used, then the section table) and the
+//           watched-address list (section 9, copied out on lw_* for hd_watch) back from DDR3,
+//           checks them, and sets pack_ok.
+// Each answer updates pack_ok, reject and ack_seq together and toggles st_t; hd3_pengine then
+// writes the pack-state qword (0x3C400008) with them, which is how the ARM learns the outcome.
+// An unknown op is answered with reject 12 and pack_ok 0.
 //
-// Section 9 (the watched-address list) is also copied out as it streams past (lw_*), so
-// hd_watch has the list without reading DDR3. It starts after the header, so the header
-// fields that locate it are complete by then.
-//
-// DDR3 writes are single qwords; load_wait holds the file transfer while one is pending. A
-// byte that arrives anyway (a broken handshake) would overwrite the pending qword, so it is
-// recorded and the load is refused (reject 9) rather than accepted with corrupt data.
+// The checks are the streaming loader's, with "bytes received" replaced by the size in the
+// command (the size of the file the ARM copied). A command written before the baseline read is
+// taken as stale and never answered, so the ARM resends (with a new sequence) when no answer
+// comes. The pack is accepted only if all hold:
+//   magic "NHDP" (1), format version 3 (2), scale 1-10 (3), no flag bits beyond the six defined
+//   (4), header file size == the size in the command (5), file size <= MAX_TOTAL (6), bucket
+//   count a power of two and not 0 (7), the section table inside the file (the file is at least
+//   0x110 bytes), every section's offset + size inside the file, its offset qword aligned, and
+//   every section but 15 (audio) ending inside the MAX_BYTES window (8), at most 256 watched
+//   addresses that fit in section 9 (10), and a consistent addition
+//   table (11): additions (header 0x40) present only with section 16, section 16 = 64 bytes per
+//   bucket with a power-of-two bucket count (header 0x4C) and section 17 present with it; no
+//   additions = no table, count and probe 0. (Reject 9 was the streaming handshake's.)
 
 module hd3_loader #(
 	parameter [27:3] PACK_Q    = 25'd0,             // qword of byte 0 in the DDR3 window
 	parameter [31:0] MAX_BYTES = 32'h0C000000,      // 192 MB, the pack window
 	parameter [31:0] MAX_TOTAL = 32'h18000000,      // 384 MB: the window + the overflow region
-	parameter [27:3] OVF_Q     = 25'h0800000        // qword of file byte MAX_BYTES (wr_hi = 1)
+	parameter [27:3] CMD_Q     = 25'h188000C,       // byte 0xC400060: the ARM's load command
+	parameter integer POLL_W   = 17                 // read the command every 2^POLL_W clocks
 )
 (
 	input             clk,
-	input             reset,
+	input             reset,           // cancels a load in progress (pack_ok -> 0)
 
-	input             load_active,     // the .hdp file transfer is in progress
-	input             load_wr,         // one byte on load_data
-	input       [7:0] load_data,
-	output            load_wait,
-
-	output reg        wr_req = 0,
-	output reg        wr_hi = 0,       // wr_addr is in the overflow window (file bytes >= 192 MB)
-	output reg [27:3] wr_addr = 0,
-	output reg [63:0] wr_data = 0,
-	input             wr_ack,
+	// one-qword reads through the engine's single-access crossing (pulse in, pulse out)
+	output reg        m_req = 0,
+	output reg [27:3] m_addr = 0,
+	input      [63:0] m_dout,
+	input             m_ready,
 
 	output reg        pack_ok = 0,
-	output reg  [3:0] reject = 0,      // why the last load was refused (0 = accepted), for debug
+	output reg  [3:0] reject = 0,      // why the last COMMIT was refused (0 = accepted)
+	output reg  [7:0] ack_seq = 0,     // sequence of the last command carried out
+	output reg        st_t = 0,        // toggles when pack_ok / reject / ack_seq were updated
 
 	// header fields used by the engine
 	output     [7:0]  scale,
@@ -66,27 +67,21 @@ module hd3_loader #(
 	output    [15:0]  max_probe,
 	output    [27:3]  keys_base,
 	output    [27:3]  rules_base,
-	output    [31:0]  hdr_word0x2c,    // condition count (kept for the stage-3 engine)
+	output    [31:0]  hdr_word0x2c,    // condition count
 	output    [31:0]  hdr_word0x30,    // frame-condition count
 	output    [31:0]  hdr_word0x34,    // watched address count
 
-	// what hd3_dict / hd3_resolve take besides the key and rule tables
 	input             cart_no_chr_rom, // the loaded game has no CHR-ROM (NES.sv: chrrom == 0)
 	output            game_ram,        // tile keys are CHR-RAM fingerprints (not CHR-ROM indices)
 	output            legacy,          // pack version < 100: no backdrop / 0xFF palette byte
 	output    [27:3]  fb_base,         // section 10, the fallback map (i32 per CHR tile)
 	output    [31:0]  fb_len,          // its entry count, header 0x44 (0 = no fallbacks)
-	// the addition tables (8a), for hd3_dict / hd3_add
 	output            add_en,          // the pack has additions (section 16 present)
 	output    [27:3]  akeys_base,      // section 16, the addition-key table
 	output    [31:0]  abucket_mask,    // its bucket count (header 0x4C) - 1
 	output    [15:0]  amax_probe,      // its maximum probe (header 0x50)
 	output    [27:3]  alists_base,     // section 17, the lists
-	// what hd3_resolve / hd3_render take (stage 3): the overscan window (header 0x10-0x1C,
-	// i32 each, clamped to 0..255 as hdref does), header flag/option bits, and the remaining
-	// section bases - in qwords, or in bytes where the reader addresses inside a section by
-	// byte (value index, background maps, scroll ratios)
-	output     [7:0]  ov_top,
+	output     [7:0]  ov_top,          // the overscan window (header 0x10-0x1C, clamped 0..255)
 	output     [7:0]  ov_right,
 	output     [7:0]  ov_bottom,
 	output     [7:0]  ov_left,
@@ -102,23 +97,15 @@ module hd3_loader #(
 	output    [27:0]  ratio_base,      // section 8, scroll ratios (bytes)
 	output    [27:3]  pal_base,        // section 12, palettes
 	output    [27:0]  bgi_base,        // section 13, value index (bytes)
-	output    [31:0]  patch_len,       // section 14, ROM patches: its length in bytes, 0 = the
-	                                   // pack has none (hd3_romfix; the ARM reads the section)
+	output    [31:0]  patch_len,       // section 14, ROM patches: its length (0 = none)
 	output    [28:0]  aud_off,         // section 15, audio: FILE offset (hd3_audio maps it)
 	output    [31:0]  aud_len,         // its length, 0 = the pack has no audio
 
-	// watched-address list (section 9), captured as it streams past, for hd_watch
+	// watched-address list (section 9), copied out on COMMIT, for hd_watch
 	output reg        lw_we = 0,
 	output reg  [7:0] lw_idx = 0,
 	output reg [31:0] lw_addr = 0
 );
-
-reg  [28:0] cnt = 0;         // bytes received (up to MAX_TOTAL: 29 bits)
-reg  [63:0] qasm;
-reg         old_active = 0;
-reg         ovf;             // more bytes than MAX_BYTES (the counter must not wrap into a match)
-reg         herr;            // a byte arrived while a qword write was still pending
-reg         sec_bad;         // a section-table entry failed its check as it arrived
 
 // the header words kept (byte offset in the file)
 reg  [31:0] h_magic, h_w04, h_opt, w_size, w_nbuck, w_maxp, h_2c, h_30, w_wcnt;
@@ -127,8 +114,7 @@ reg  [31:0] w_nadd, w_anb, w_amp, h_s16off, w_s16len, h_s17off, w_s17len;
 reg  [31:0] h_ov [4];          // 0x10 top, 0x14 right, 0x18 bottom, 0x1C left
 reg  [31:0] h_s2off, h_s3off, h_s4off, h_s5off, h_s6off, h_s7off, h_s8off, h_s12off, h_s13off;
 reg  [31:0] h_s14len, h_s15off, h_s15len;
-
-assign load_wait = wr_req;
+reg         sec_bad;           // a section-table entry failed its check
 
 assign scale        = h_w04[23:16];    // 0x06
 assign flags        = h_w04[31:24];    // 0x07
@@ -141,10 +127,8 @@ assign hdr_word0x2c = h_2c;
 assign hdr_word0x30 = h_30;
 assign hdr_word0x34 = w_wcnt;
 // Tile keys: Mesen uses !HasChrRom for tiles and fallbacks (spec; HdNesPack), so a cart with
-// BOTH CHR-ROM and CHR-RAM (an NES 2.0 header with both sizes, e.g. Metroid + mmm.ips) keys by
-// tile index. The converter records the game's type in flags bit 4 when it knew it (bit 5,
-// from the ROM or because every key is one kind); 39 corpus packs do not, and for those the
-// loaded cart decides. NOT mapper_flags[15] (has_chr_ram): that is set for such a cart too.
+// BOTH CHR-ROM and CHR-RAM keys by tile index. The converter records the game's type in flags
+// bit 4 when it knew it (bit 5); otherwise the loaded cart decides.
 assign game_ram     = flags[5] ? flags[4] : cart_no_chr_rom;
 assign legacy       = flags[0];
 assign fb_base      = PACK_Q + h_s10off[27:3];     // 0xD0: section 10 offset
@@ -178,140 +162,164 @@ assign patch_len    = h_s14len;                    // 0xF4: section 14's length 
 assign aud_off      = h_s15off[28:0];              // 0xF8: section 15, audio (a file offset)
 assign aud_len      = h_s15len;                    // 0xFC: its length (0 = no audio)
 
-// the header word / section-table entry that the current byte completes (little-endian)
-wire [31:0] b_word  = {load_data, qasm[63:40]};
-wire [63:0] b_entry = {load_data, qasm[63:8]};
-wire        in_hdr  = cnt[28:9] == 0;                 // the 512-byte header
-// section k (bytes 0x80+8k..+7, k = 0..17 = qwords 16..33): offset entry[31:0], size
-// entry[63:32]; it must lie inside the file and be qword aligned (the engine addresses
-// sections in qwords). Every section but 15 (audio, which hd3_audio reads through its own
-// file-offset mapping) must also end inside the pack window: the engine's readers address
-// the window only.
-wire        sec_end = in_hdr & (cnt[8:3] >= 6'd16) & (cnt[8:3] < 6'd34) & (cnt[2:0] == 3'd7);
-wire [32:0] sec_top = {1'b0, b_entry[31:0]} + {1'b0, b_entry[63:32]};
-wire        sec_err = sec_top > {1'b0, w_size} || b_entry[2:0] != 3'd0 ||
-                      (cnt[8:3] != 6'd31 && sec_top > {1'b0, MAX_BYTES});
-wire        sections_ok = ~sec_bad & (cnt > 29'h10F);  // and the whole table arrived
-// file qword -> DDR3: below MAX_BYTES in the pack window, above it in the overflow window
-wire [25:0] fq      = cnt[28:3];
-wire        f_hi    = fq >= MAX_BYTES[28:3];
-wire [27:3] f_addr  = f_hi ? OVF_Q + 25'(fq - MAX_BYTES[28:3]) : PACK_Q + fq[24:0];
+// section k = header qword 16 + k (offset [31:0], size [63:32]): it must lie inside the file and
+// be qword aligned (the engine addresses sections in qwords); every section but 15 (audio, read
+// through hd3_audio's own file-offset mapping) must also end inside the pack window.
+wire [32:0] sec_top = {1'b0, m_dout[31:0]} + {1'b0, m_dout[63:32]};
+wire        sec_err = sec_top > {1'b0, w_size} || m_dout[2:0] != 3'd0 ||
+                      (hq != 6'd31 && sec_top > {1'b0, MAX_BYTES});
 
 // the addition table (reject 11)
 wire        anb_pow2 = w_anb != 0 && (w_anb & (w_anb - 1)) == 0;
 wire        atab_ok  = (w_s16len == 0) ? (w_nadd == 0 && w_anb == 0 && w_amp == 0 && w_s17len == 0)
                                        : (anb_pow2 && w_anb <= 32'h03FFFFFF &&
                                           w_s16len == {w_anb[25:0], 6'd0} && w_s17len != 0);
-
-// section 9 = watched addresses, u32 each; the header (bytes 0-255) is complete before it
-wire [28:0] w_rel   = cnt - w_s9off[28:0];
-wire        w_in9   = cnt[28:8] != 0 && {3'd0, cnt} >= w_s9off && w_rel < 29'd1024 &&
-                      {5'd0, w_rel[28:2]} < w_wcnt;
+// section 9 = watched addresses, u32 each (reject 10)
 wire        wlist_ok = w_wcnt <= 32'd256 && {w_wcnt, 2'b00} <= {2'b00, w_s9len};
 
+reg  [31:0] cmd_size = 0;      // the file size in the COMMIT being carried out
+wire  [3:0] verdict = (h_magic != 32'h5044484E)                    ? 4'd1 :   // "NHDP"
+                      (h_w04[15:0] != 16'd3)                       ? 4'd2 :
+                      (scale == 8'd0 || scale > 8'd10)             ? 4'd3 :
+                      (flags[7:6] != 2'd0)                         ? 4'd4 :
+                      (cmd_size != w_size)                         ? 4'd5 :
+                      (w_size > MAX_TOTAL)                         ? 4'd6 :
+                      (w_nbuck == 0 || (w_nbuck & (w_nbuck - 1)) != 0) ? 4'd7 :
+                      (sec_bad || w_size < 32'h110)                ? 4'd8 :   // + table in the file
+                      (!wlist_ok)                                  ? 4'd10 :
+                      (!atab_ok)                                   ? 4'd11 : 4'd0;
+
+localparam [2:0] S_IDLE = 3'd0, S_CMD = 3'd1, S_HDR = 3'd2, S_W9 = 3'd3, S_W9B = 3'd4,
+                 S_JUDGE = 3'd5;
+reg  [2:0] st = S_IDLE;
+reg [POLL_W-1:0] tmr = {POLL_W{1'b1}};   // the first read (the baseline) on the first clock
+reg        busy = 0;           // a read is outstanding (a reset waits for it in S_IDLE, which
+                               // ignores answers, so a cancelled read's answer is dropped)
+reg        based = 0;         // the first command read after power-up was taken
+reg  [7:0] last_seq = 0;       // the last command carried out (or found at power-up)
+reg  [7:0] cmd_seq = 0;
+reg  [5:0] hq = 0;             // header qword being read (0..33)
+reg  [8:0] wi = 0;             // watch-list entry being copied
+reg  [8:0] wn = 0;             // entries to copy: min(watched count, 256)
+reg [31:0] w_hold = 0;         // the second entry of the qword just read
+
+wire       take = m_ready;
+wire [8:0] wn_new = (w_wcnt > 32'd256) ? 9'd256 : w_wcnt[8:0];
+
 always @(posedge clk) begin
-	old_active <= load_active;
-	if (wr_ack) wr_req <= 0;
+	m_req <= 0;
 	lw_we <= 0;
-	if (load_active & load_wr & w_in9 & (w_rel[1:0] == 2'd3)) begin
-		lw_we   <= 1;
-		lw_idx  <= w_rel[9:2];
-		lw_addr <= {load_data, qasm[63:40]};
+	if (m_ready) busy <= 0;
+	tmr <= tmr + 1'd1;
+
+	case (st)
+	S_IDLE: if (&tmr && !busy) begin
+		m_req <= 1; m_addr <= CMD_Q; busy <= 1; st <= S_CMD;
 	end
 
-	if (load_active & ~old_active) begin
-		pack_ok <= 0;
-		cnt     <= 0;
-		ovf     <= 0;
-		herr    <= 0;
-		sec_bad <= 0;
-		h_magic <= 0;          // a file too short to carry a header is then refused (reject 1)
+	S_CMD: if (take) begin
+		st <= S_IDLE;
+		if (!based) begin
+			based    <= 1;
+			last_seq <= m_dout[47:40];
+		end
+		else if (m_dout[63:56] == 8'hC5 && m_dout[47:40] != last_seq) begin
+			last_seq <= m_dout[47:40];
+			cmd_seq  <= m_dout[47:40];
+			pack_ok  <= 0;
+			if (m_dout[55:48] == 8'd2) begin                       // COMMIT
+				cmd_size <= m_dout[31:0];
+				sec_bad  <= 0;
+				hq       <= 0;
+				m_req    <= 1; m_addr <= PACK_Q; busy <= 1;
+				st       <= S_HDR;
+			end
+			else begin                                              // BEGIN (or unknown)
+				reject  <= (m_dout[55:48] == 8'd1) ? 4'd0 : 4'd12;
+				ack_seq <= m_dout[47:40];
+				st_t    <= ~st_t;
+			end
+		end
 	end
 
-	if (load_active & load_wr & wr_req & ~wr_ack) herr <= 1;
-
-	if (load_active & load_wr) begin
-		qasm <= {load_data, qasm[63:8]};
-		if (in_hdr & (cnt[1:0] == 2'd3)) case (cnt[8:2])
-			7'd0:  h_magic <= b_word;
-			7'd1:  h_w04   <= b_word;
-			7'd3:  h_opt   <= b_word;
-			7'd4:  h_ov[0] <= b_word;
-			7'd5:  h_ov[1] <= b_word;
-			7'd6:  h_ov[2] <= b_word;
-			7'd7:  h_ov[3] <= b_word;
-			7'd8:  w_size  <= b_word;
-			7'd9:  w_nbuck <= b_word;
-			7'd10: w_maxp  <= b_word;
-			7'd11: h_2c    <= b_word;
-			7'd12: h_30    <= b_word;
-			7'd13: w_wcnt  <= b_word;
-			7'd16: w_nadd  <= b_word;
-			7'd17: h_44    <= b_word;
-			7'd19: w_anb   <= b_word;
-			7'd20: w_amp   <= b_word;
-			7'd32: h_s0off <= b_word;
-			7'd34: h_s1off <= b_word;
-			7'd36: h_s2off <= b_word;
-			7'd38: h_s3off <= b_word;
-			7'd40: h_s4off <= b_word;
-			7'd42: h_s5off <= b_word;
-			7'd44: h_s6off <= b_word;
-			7'd46: h_s7off <= b_word;
-			7'd48: h_s8off <= b_word;
-			7'd56: h_s12off <= b_word;
-			7'd58: h_s13off <= b_word;
-			7'd61: h_s14len <= b_word;
-			7'd62: h_s15off <= b_word;
-			7'd63: h_s15len <= b_word;
-			7'd50: w_s9off <= b_word;
-			7'd51: w_s9len <= b_word;
-			7'd52: h_s10off <= b_word;
-			7'd64: h_s16off <= b_word;
-			7'd65: w_s16len <= b_word;
-			7'd66: h_s17off <= b_word;
-			7'd67: w_s17len <= b_word;
+	S_HDR: if (take) begin
+		case (hq)
+			6'd0:  begin h_magic  <= m_dout[31:0]; h_w04    <= m_dout[63:32]; end
+			6'd1:  begin                           h_opt    <= m_dout[63:32]; end
+			6'd2:  begin h_ov[0]  <= m_dout[31:0]; h_ov[1]  <= m_dout[63:32]; end
+			6'd3:  begin h_ov[2]  <= m_dout[31:0]; h_ov[3]  <= m_dout[63:32]; end
+			6'd4:  begin w_size   <= m_dout[31:0]; w_nbuck  <= m_dout[63:32]; end
+			6'd5:  begin w_maxp   <= m_dout[31:0]; h_2c     <= m_dout[63:32]; end
+			6'd6:  begin h_30     <= m_dout[31:0]; w_wcnt   <= m_dout[63:32]; end
+			6'd8:  begin w_nadd   <= m_dout[31:0]; h_44     <= m_dout[63:32]; end
+			6'd9:  begin                           w_anb    <= m_dout[63:32]; end
+			6'd10: begin w_amp    <= m_dout[31:0];                            end
+			6'd16: h_s0off  <= m_dout[31:0];
+			6'd17: h_s1off  <= m_dout[31:0];
+			6'd18: h_s2off  <= m_dout[31:0];
+			6'd19: h_s3off  <= m_dout[31:0];
+			6'd20: h_s4off  <= m_dout[31:0];
+			6'd21: h_s5off  <= m_dout[31:0];
+			6'd22: h_s6off  <= m_dout[31:0];
+			6'd23: h_s7off  <= m_dout[31:0];
+			6'd24: h_s8off  <= m_dout[31:0];
+			6'd25: begin w_s9off  <= m_dout[31:0]; w_s9len  <= m_dout[63:32]; end
+			6'd26: h_s10off <= m_dout[31:0];
+			6'd28: h_s12off <= m_dout[31:0];
+			6'd29: h_s13off <= m_dout[31:0];
+			6'd30: h_s14len <= m_dout[63:32];
+			6'd31: begin h_s15off <= m_dout[31:0]; h_s15len <= m_dout[63:32]; end
+			6'd32: begin h_s16off <= m_dout[31:0]; w_s16len <= m_dout[63:32]; end
+			6'd33: begin h_s17off <= m_dout[31:0]; w_s17len <= m_dout[63:32]; end
 			default: ;
 		endcase
-		if (sec_end & sec_err) sec_bad <= 1;
-		if (cnt[2:0] == 3'd7) begin
-			wr_req  <= 1;
-			wr_hi   <= f_hi;
-			wr_addr <= f_addr;
-			wr_data <= {load_data, qasm[63:8]};
+		if (hq >= 6'd16 && sec_err) sec_bad <= 1;   // w_size (qword 4) is in by now
+		if (hq != 6'd33) begin
+			hq     <= hq + 6'd1;
+			m_req  <= 1; m_addr <= m_addr + 25'd1; busy <= 1;
 		end
-		if (cnt == 29'h1FFFFFFF) ovf <= 1;
-		else cnt <= cnt + 29'd1;
+		else begin
+			wi <= 0;
+			wn <= wn_new;
+			if (wn_new == 0) st <= S_JUDGE;
+			else begin
+				m_req <= 1; m_addr <= PACK_Q + w_s9off[27:3]; busy <= 1;
+				st    <= S_W9;
+			end
+		end
 	end
 
-	// end of the transfer: flush a final partial qword (zero-padded), then judge the header
-	if (~load_active & old_active) begin
-		if (cnt[2:0] != 3'd0) begin
-			wr_req  <= 1;
-			wr_hi   <= f_hi;
-			wr_addr <= f_addr;
-			wr_data <= qasm >> {~cnt[2:0] + 3'd1, 3'd0};
-		end
-		reject <= (h_magic != 32'h5044484E)                    ? 4'd1 :   // "NHDP"
-		          (h_w04[15:0] != 16'd3)                       ? 4'd2 :
-		          (scale == 8'd0 || scale > 8'd10)             ? 4'd3 :
-		          (flags[7:6] != 2'd0)                         ? 4'd4 :
-		          (ovf || {3'd0, cnt} != w_size)               ? 4'd5 :
-		          (w_size > MAX_TOTAL)                         ? 4'd6 :
-		          (w_nbuck == 0 || (w_nbuck & (w_nbuck - 1)) != 0) ? 4'd7 :
-		          (!sections_ok)                               ? 4'd8 :
-		          (herr)                                       ? 4'd9 :
-		          (!wlist_ok)                                  ? 4'd10 :
-		          (!atab_ok)                                   ? 4'd11 : 4'd0;
-		pack_ok <= (h_magic == 32'h5044484E) && h_w04[15:0] == 16'd3 && scale != 0 && scale <= 8'd10 &&
-		           flags[7:6] == 2'd0 && !ovf && {3'd0, cnt} == w_size && w_size <= MAX_TOTAL &&
-		           w_nbuck != 0 && (w_nbuck & (w_nbuck - 1)) == 0 && sections_ok && !herr && wlist_ok &&
-		           atab_ok;
+	S_W9: if (take) begin                          // entry wi = the qword's low word
+		lw_we   <= 1; lw_idx <= wi[7:0]; lw_addr <= m_dout[31:0];
+		w_hold  <= m_dout[63:32];
+		wi      <= wi + 9'd1;
+		st      <= (wi + 9'd1 < wn) ? S_W9B : S_JUDGE;
 	end
+
+	S_W9B: begin                                   // entry wi = its high word
+		lw_we   <= 1; lw_idx <= wi[7:0]; lw_addr <= w_hold;
+		wi      <= wi + 9'd1;
+		if (wi + 9'd1 < wn) begin
+			m_req <= 1; m_addr <= m_addr + 25'd1; busy <= 1;
+			st    <= S_W9;
+		end
+		else st <= S_JUDGE;
+	end
+
+	S_JUDGE: begin
+		pack_ok <= verdict == 4'd0;
+		reject  <= verdict;
+		ack_seq <= cmd_seq;
+		st_t    <= ~st_t;
+		st      <= S_IDLE;
+	end
+
+	default: st <= S_IDLE;
+	endcase
 
 	if (reset) begin
-		wr_req  <= 0;
 		pack_ok <= 0;
+		st      <= S_IDLE;
 	end
 end
 

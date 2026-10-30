@@ -173,7 +173,7 @@ wire [31:0] patch_len;
 wire  [7:0] ov_top, ov_right, ov_bottom, ov_left;
 wire        game_ram, legacy, add_en, has_pal, cache_en, render_orig;
 
-hd3_loader loader (
+hd3_loader_stream loader (
 	.clk(clk), .reset(reset),
 	.load_active(load_active), .load_wr(load_wr), .load_data(load_data), .load_wait(load_wait),
 	.wr_req(ld_wr_req), .wr_hi(ld_wr_hi), .wr_addr(ld_wr_addr), .wr_data(ld_wr_data),
