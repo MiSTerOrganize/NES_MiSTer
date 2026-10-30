@@ -1,0 +1,37 @@
+# Text is stored and checked out with LF, so raw.githubusercontent.com serves the same
+# bytes every machine has (the MiSTer is Linux).
+* text=auto eol=lf
+
+# Binary artifacts - never normalized.
+*.rbf binary
+*.png binary
+*.pal binary
+*.bin binary
+*.ogg binary
+*.ips binary
+*.hdp binary
+*.nes binary
+*.jdi binary
+*.pin binary
+*.sld binary
+
+# The ARM daemon has no extension - name it explicitly (check with git check-attr binary).
+games/NES_HD/NES_HD binary
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.c    text eol=lf
+*.h    text eol=lf
+*.cpp  text eol=lf
+*.sv   text eol=lf
+*.v    text eol=lf
+*.vhd  text eol=lf
+*.qip  text eol=lf
+*.qpf  text eol=lf
+*.qsf  text eol=lf
+*.sdc  text eol=lf
+*.tsv  text eol=lf
+*.summary text eol=lf
+# Windows batch file keeps CRLF
+*.bat  text eol=crlf

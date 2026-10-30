@@ -1,0 +1,20 @@
+Fitter Status : Successful - Thu Oct 29 12:43:33 2026
+Quartus Prime Version : 17.0.0 Build 595 04/25/2017 SJ Lite Edition
+Revision Name : NES_PAINT
+Top-level Entity Name : sys_top
+Family : Cyclone V
+Device : 5CSEBA6U23I7
+Timing Models : Final
+Logic utilization (in ALMs) : 37,573 / 41,910 ( 90 % )
+Total registers : 47754
+Total pins : 145 / 314 ( 46 % )
+Total virtual pins : 0
+Total block memory bits : 1,884,696 / 5,662,720 ( 33 % )
+Total RAM Blocks : 262 / 553 ( 47 % )
+Total DSP Blocks : 110 / 112 ( 98 % )
+Total HSSI RX PCSs : 0
+Total HSSI PMA RX Deserializers : 0
+Total HSSI TX PCSs : 0
+Total HSSI PMA TX Serializers : 0
+Total PLLs : 3 / 6 ( 50 % )
+Total DLLs : 0 / 4 ( 0 % )

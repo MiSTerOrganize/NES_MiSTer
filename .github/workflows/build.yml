@@ -1,0 +1,102 @@
+name: Build NES_HD ARM daemon
+# Push runs are titled by the commit message (GitHub's default); a manual run is titled by
+# its `reason`, else the branch.
+run-name: "${{ inputs.reason || (github.event_name == 'workflow_dispatch' && github.ref_name) || '' }}"
+
+on:
+  push:
+    branches: [master]
+    # Only the daemon source can change the daemon. FPGA, tools and docs pushes must not
+    # rebuild and re-commit it.
+    paths:
+      - 'src/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Build label (shown as the run title in the Actions tab)'
+        required: false
+        type: string
+
+jobs:
+  build-arm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the daemon (debian:bookworm, arm-linux-gnueabihf)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/build" -w /build debian:bookworm bash -c '
+            set -e
+            ok=0
+            for try in 1 2 3; do
+              if apt-get -o Acquire::Retries=5 update -qq \
+                 && apt-get -o Acquire::Retries=5 install -y -qq gcc-arm-linux-gnueabihf libc6-dev-armhf-cross >/dev/null; then
+                ok=1; break
+              fi
+              echo "WARN: apt attempt $try failed; retrying" >&2; sleep $((try * 15))
+            done
+            [ "$ok" = 1 ] || { echo "ERROR: apt-get failed" >&2; exit 1; }
+            mkdir -p build-arm
+            sh src/build_arm.sh build-arm/NES_HD
+            chown -R '"$(id -u):$(id -g)"' build-arm
+          '
+          test -s build-arm/NES_HD
+          file build-arm/NES_HD
+          md5sum build-arm/NES_HD
+
+      - name: Commit the daemon back to master
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/ci-binary
+          cp build-arm/NES_HD /tmp/ci-binary/NES_HD
+          git config user.email "ci@misterorganize"
+          git config user.name "MiSTer Organize CI"
+          if grep -rqE "TEMPORARY PROFILE|TEMPORARY DIAG|TEMPORARY SUB-PROFILE|REVERT AFTER MEASURED" src; then
+            echo "[CI gate] Diagnostic markers in src/ - not committing the binary (artifact only)."
+            exit 0
+          fi
+          # Re-apply on reject: never `git pull --rebase` (a binary merge conflict cannot be
+          # resolved). Reset to the new tip and copy THIS build's binary over it.
+          PUSH_OK=0; NOTHING_TO_DO=0; STALE=0
+          for i in 1 2 3 4 5; do
+            git fetch origin master
+            git reset --hard origin/master
+            # Staleness guard: builds do not finish in start order. If the tip already carries
+            # a binary built from NEWER source, do not overwrite it. Fails open when unsure.
+            TIP_SRC=$(gh api "repos/${{ github.repository }}/commits?path=games/NES_HD/NES_HD&per_page=1" \
+                        --jq '.[0].commit.message' 2>/dev/null \
+                      | sed -n '1s/^CI: rebuild ARM daemon for \([0-9a-f]\{40\}\)$/\1/p')
+            if [ -n "$TIP_SRC" ] && [ "$TIP_SRC" != "${{ github.sha }}" ]; then
+              REL=$(gh api "repos/${{ github.repository }}/compare/${{ github.sha }}...$TIP_SRC" \
+                      --jq '.status' 2>/dev/null || echo unknown)
+              if [ "$REL" = "ahead" ]; then
+                echo "[staleness guard] master already has a daemon built from newer source $TIP_SRC - skipping."
+                STALE=1; break
+              fi
+            fi
+            cp /tmp/ci-binary/NES_HD games/NES_HD/NES_HD
+            chmod +x games/NES_HD/NES_HD
+            git add games/NES_HD/NES_HD
+            if git diff --cached --quiet; then
+              echo "Daemon unchanged - nothing to commit."; NOTHING_TO_DO=1; break
+            fi
+            git commit -m "CI: rebuild ARM daemon for ${{ github.sha }}"
+            if git push; then echo "Pushed on attempt $i."; PUSH_OK=1; break; fi
+            echo "Push rejected (attempt $i) - resyncing"; sleep 2
+          done
+          if [ "$PUSH_OK" != 1 ] && [ "$NOTHING_TO_DO" != 1 ] && [ "$STALE" != 1 ]; then
+            echo "::error::Daemon commit-back failed after 5 attempts (the artifact still has it)."
+            exit 1
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NES_HD-daemon
+          path: build-arm/NES_HD
